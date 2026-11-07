@@ -1,0 +1,935 @@
+#include "app/AppController.h"
+#include "adapters/log/SerialOutput.h"
+#include <stdio.h>
+#include <string.h>
+namespace WallE {
+
+namespace {
+
+/**
+ * 中文：判断字节数组是否以指定 ASCII 前缀开头，比较时忽略大小写。
+ * English: Checks whether a byte array starts with an ASCII prefix, ignoring case.
+ *
+ * @param data 中文：待检查的原始字节数据。
+ *             English: Raw bytes to check.
+ * @param len 中文：data 的字节长度。
+ *            English: Byte length of data.
+ * @param prefix 中文：以 '\0' 结尾的 ASCII 前缀。
+ *               English: Null-terminated ASCII prefix.
+ * @return 中文：匹配前缀返回 true，否则返回 false。
+ *         English: true when the prefix matches; false otherwise.
+ */
+bool startsWithIgnoreCase(const uint8_t* data, size_t len, const char* prefix) {
+  if (data == nullptr || prefix == nullptr) {
+    return false;
+  }
+
+  for (size_t i = 0; prefix[i] != '\0'; ++i) {
+    if (i >= len) {
+      return false;
+    }
+
+    // 中文：received/expected 都是 ASCII 命令字符，只做英文大小写折叠，不碰中文正文。
+    // English: received/expected are ASCII command characters; only English case folding is applied and message body bytes are untouched.
+    char received = static_cast<char>(data[i]);
+    char expected = prefix[i];
+    if (received >= 'A' && received <= 'Z') {
+      received = static_cast<char>(received - 'A' + 'a');
+    }
+    if (expected >= 'A' && expected <= 'Z') {
+      expected = static_cast<char>(expected - 'A' + 'a');
+    }
+    if (received != expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 中文：判断字节数组是否和指定 ASCII 文本完全相同，比较时忽略大小写。
+ * English: Checks whether a byte array exactly equals an ASCII text, ignoring case.
+ *
+ * @param data 中文：待比较的原始字节数据。
+ *             English: Raw bytes to compare.
+ * @param len 中文：data 的字节长度。
+ *            English: Byte length of data.
+ * @param text 中文：以 '\0' 结尾的 ASCII 文本。
+ *             English: Null-terminated ASCII text.
+ * @return 中文：完全相同返回 true，否则返回 false。
+ *         English: true when exactly equal; false otherwise.
+ */
+bool equalsIgnoreCase(const uint8_t* data, size_t len, const char* text) {
+  if (data == nullptr || text == nullptr) {
+    return false;
+  }
+
+  size_t i = 0;
+  for (; i < len && text[i] != '\0'; ++i) {
+    // 中文：这里只用于比较动作名 zoom 等 ASCII 关键字。
+    // English: This comparison is only for ASCII keywords such as the zoom action name.
+    char received = static_cast<char>(data[i]);
+    char expected = text[i];
+    if (received >= 'A' && received <= 'Z') {
+      received = static_cast<char>(received - 'A' + 'a');
+    }
+    if (expected >= 'A' && expected <= 'Z') {
+      expected = static_cast<char>(expected - 'A' + 'a');
+    }
+    if (received != expected) {
+      return false;
+    }
+  }
+  return i == len && text[i] == '\0';
+}
+
+/**
+ * 中文：去掉命令参数前后的 ASCII 空格和制表符，不改动内容缓冲区本身。
+ * English: Trims ASCII spaces and tabs around a command argument without modifying the underlying buffer.
+ *
+ * @param[in,out] data 中文：输入为原始参数起点，输出为修剪后的起点。
+ *                     English: Input is the raw argument start; output is the trimmed start.
+ * @param[in,out] length 中文：输入为原始长度，输出为修剪后的长度。
+ *                       English: Input is the raw length; output is the trimmed length.
+ * @return 无 / None.
+ */
+void trimAsciiWhitespace(const uint8_t*& data, size_t& length) {
+  while (length > 0 && (data[0] == ' ' || data[0] == '\t')) {
+    ++data;
+    --length;
+  }
+
+  while (length > 0) {
+    // 中文：tail 是当前参数最后一个字节，只移除 ASCII 空格/制表符。
+    // English: tail is the last byte of the current argument; only ASCII space/tab is trimmed.
+    const uint8_t tail = data[length - 1];
+    if (tail != ' ' && tail != '\t') {
+      break;
+    }
+    --length;
+  }
+}
+
+/**
+ * 中文：解析眼睛动作命令；当前格式是 eyeaction:zoom。
+ * English: Parses an eye action command; the current format is eyeaction:zoom.
+ *
+ * @param packet 中文：串口输入包。
+ *               English: Serial input packet.
+ * @param[out] actionData 中文：解析成功时指向动作名起点，例如 zoom。
+ *                        English: On success, points to the action name such as zoom.
+ * @param[out] actionLength 中文：动作名长度。
+ *                          English: Length of the action name.
+ * @return 中文：是 eyeaction 命令且动作名非空时返回 true。
+ *         English: true when this is an eyeaction command with a non-empty action name.
+ */
+bool parseEyeAction(const InputPacket& packet, const uint8_t*& actionData, size_t& actionLength) {
+  // 中文：actionData/actionLength 初始指向完整输入包，确认前缀后再移动到动作名。
+  // English: actionData/actionLength first point to the whole packet and move to the action name after prefix detection.
+  actionData = packet.data;
+  actionLength = packet.length;
+  if (actionData == nullptr || actionLength == 0) {
+    return false;
+  }
+
+  if (!startsWithIgnoreCase(actionData, actionLength, "eyeaction:")) {
+    return false;
+  }
+
+  actionData += 10;
+  actionLength -= 10;
+  trimAsciiWhitespace(actionData, actionLength);
+  return actionLength > 0;
+}
+
+/**
+ * 中文：解析已经确认前缀的非负整数命令参数，例如 power:80 / openchat:1。
+ * English: Parses the numeric argument of a prefix-matched command, such as power:80 / openchat:1.
+ *
+ * @param packet 中文：串口输入包。
+ *               English: Serial input packet.
+ * @param prefix 中文：命令前缀，例如 power:。
+ *               English: Command prefix, for example power:.
+ * @param[out] value 中文：解析出的整数值。
+ *                   English: Parsed integer value.
+ * @return 中文：参数存在且全部为数字时返回 true。
+ *         English: true when the argument exists and is numeric.
+ */
+bool parseNumberAfterPrefix(const InputPacket& packet, const char* prefix, int& value) {
+  const uint8_t* data = packet.data;
+  size_t length = packet.length;
+  if (data == nullptr || length == 0 || prefix == nullptr) {
+    return false;
+  }
+
+  size_t prefixLength = 0;
+  while (prefix[prefixLength] != '\0') {
+    ++prefixLength;
+  }
+  if (length <= prefixLength) {
+    return false;
+  }
+  data += prefixLength;
+  length -= prefixLength;
+  trimAsciiWhitespace(data, length);
+  if (length == 0) {
+    return false;
+  }
+
+  int parsed = 0;
+  for (size_t i = 0; i < length; ++i) {
+    if (data[i] < '0' || data[i] > '9') {
+      return false;
+    }
+    parsed = parsed * 10 + (data[i] - '0');
+    if (parsed > 1000) {
+      return false;
+    }
+  }
+
+  value = parsed;
+  return true;
+}
+
+/**
+ * 中文：解析主屏聊天消息；支持 you: 和 ai: 前缀，未带前缀时默认当作用户消息。
+ * English: Parses a main-display chat message; supports you: and ai: prefixes, and defaults to user text without a prefix.
+ *
+ * @param packet 中文：串口输入包。
+ *               English: Serial input packet.
+ * @param[out] role 中文：解析出的消息角色。
+ *                  English: Parsed message role.
+ * @param[out] data 中文：解析后的正文起点，仍指向原始字节，保持 GBK/GB2312 不转换。
+ *                  English: Parsed body start, still pointing to raw bytes to preserve GBK/GB2312 without conversion.
+ * @param[out] length 中文：正文长度。
+ *                    English: Body length.
+ * @return 中文：正文非空时返回 true，否则返回 false。
+ *         English: true when the body is non-empty; false otherwise.
+ */
+bool parseSerialMessage(const InputPacket& packet, ChatRole& role, const uint8_t*& data,
+                        size_t& length) {
+  // 中文：未带前缀时默认当成用户消息，便于简单串口调试。
+  // English: Without an explicit prefix, the packet defaults to a user message for easier Serial testing.
+  role = ChatRole::User;
+  data = packet.data;
+  length = packet.length;
+
+  if (data == nullptr || length == 0) {
+    return false;
+  }
+  if (startsWithIgnoreCase(data, length, "you:")) {
+    data += 4;
+    length -= 4;
+  } else if (startsWithIgnoreCase(data, length, "ai:")) {
+    role = ChatRole::Assistant;
+    data += 3;
+    length -= 3;
+  }
+
+  // 中文：允许 "you: 内容" 这种格式，但不修改中文正文的原始编码。
+  // English: Accept "you: text" while keeping the body bytes in their original encoding.
+  if (length > 0 && *data == ' ') {
+    ++data;
+    --length;
+  }
+  return length > 0;
+}
+
+/**
+ * 中文：解析 pca9685: 逗号分隔的 15 个整数。
+ * English: Parses 15 comma-separated integers following pca9685: prefix.
+ */
+bool parsePca9685(const InputPacket& packet, int32_t* values) {
+  const uint8_t* data = packet.data;
+  size_t length = packet.length;
+  
+  if (values == nullptr || !startsWithIgnoreCase(data, length, "pca9685:")) {
+    return false;
+  }
+  
+  data += 8;
+  length -= 8;
+  
+  size_t count = 0;
+  int32_t parsed[15] = {0};
+  uint32_t currentVal = 0;
+  bool inNumber = false;
+  bool hasDigit = false;
+  bool isNegative = false;
+  
+  for (size_t i = 0; i <= length; ++i) {
+    char c = (i < length) ? static_cast<char>(data[i]) : ',';
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      continue;
+    }
+    
+    if (c == '-') {
+      if (inNumber) return false;
+      isNegative = true;
+      inNumber = true;
+    } else if (c >= '0' && c <= '9') {
+      const uint32_t digit = static_cast<uint32_t>(c - '0');
+      const uint32_t limit = static_cast<uint32_t>(INT32_MAX) + (isNegative ? 1U : 0U);
+      if (currentVal > (limit - digit) / 10) return false;
+      currentVal = currentVal * 10 + digit;
+      inNumber = true;
+      hasDigit = true;
+    } else if (c == ',') {
+      if (!hasDigit) return false;
+      if (count < 15) {
+        parsed[count++] = isNegative
+            ? (currentVal == static_cast<uint32_t>(INT32_MAX) + 1U
+                   ? INT32_MIN : -static_cast<int32_t>(currentVal))
+            : static_cast<int32_t>(currentVal);
+      } else {
+        return false;
+      }
+      currentVal = 0;
+      inNumber = false;
+      hasDigit = false;
+      isNegative = false;
+    } else {
+      return false;
+    }
+  }
+  
+  if (count != 15) return false;
+  // A rejected packet must not partially overwrite the last valid batch.
+  memcpy(values, parsed, sizeof(parsed));
+  return true;
+}
+
+}  // namespace
+
+/**
+ * 中文：构造控制器并保存各端口引用；不拥有这些对象的生命周期。
+ * English: Constructs the controller and stores port references; it does not own these objects.
+ *
+ * @param logger 中文：日志输出端口。
+ *               English: Logger output port.
+ * @param input 中文：串口输入端口。
+ *              English: Serial input port.
+ * @param display 中文：主屏显示端口。
+ *                English: Main display port.
+ * @param eyeDisplay 中文：眼睛屏显示端口。
+ *                   English: Eye display port.
+ * @param pca9685 中文：PCA9685 驱动端口。
+ *                English: PCA9685 driver port.
+ */
+AppController::AppController(ILogger& logger, IInputPort& input, IDisplayPort& display,
+                             IEyeDisplayPort& eyeDisplay, IPca9685Port& pca9685,
+                             IImageStreamPort& imageStream,
+                             INetworkConfigPort& networkConfig)
+    : logger_(logger),
+      input_(input),
+      display_(display),
+      eyeDisplay_(eyeDisplay),
+      pca9685_(pca9685),
+      imageStream_(imageStream),
+      networkConfig_(networkConfig) {}
+
+/**
+ * 中文：启动应用；初始化日志、主屏、输入端口，并在主屏显示 READY 状态。
+ * English: Starts the application; initializes logger, main display, input port, and shows READY on the main display.
+ *
+ * @param 无 / None.
+ * @return 无 / None.
+ */
+void AppController::begin() {
+  logger_.begin();
+  logger_.info("Wall-E Arduino serial display boot");
+  char memorySummary[96];
+  snprintf(memorySummary, sizeof(memorySummary),
+           "memory detected: flash=%lu bytes, psram=%lu bytes",
+           static_cast<unsigned long>(ESP.getFlashChipSize()),
+           static_cast<unsigned long>(ESP.getPsramSize()));
+  logger_.info(memorySummary);
+
+  if (!display_.begin()) {
+    logger_.error("display init failed");
+  }
+  setState(AppState::Booting);
+  session_.addText(ChatRole::System, display_.fontOk() ? "TEXT OK" : "TEXT ERR");
+
+  input_.begin();
+  session_.addText(ChatRole::System, "READY");
+  setState(AppState::Ready);
+  display_.showPower(powerPercent_);
+
+  if (display_.imageDmaReady()) {
+    logger_.info("main display async DMA ready");
+  } else {
+    logger_.warn("main display image DMA unavailable");
+  }
+
+  if (imageStream_.begin()) {
+    logger_.info("Wi-Fi image stream hot standby started");
+  } else {
+    logger_.warn("Wi-Fi image stream disabled; check PSRAM and Secrets.h");
+  }
+
+  pca9685_.begin();
+  
+  bootMs_ = millis();
+  pca9685Rx_ = false;
+
+  uiMessageQueue_ = xQueueCreate(WallEConfig::kUiMessageQueueDepth,
+                                 sizeof(QueuedInputPacket));
+  if (uiMessageQueue_ == nullptr) {
+    logger_.error("control task UI queue allocation failed");
+    return;
+  }
+
+  const BaseType_t taskCreated = xTaskCreatePinnedToCore(
+      controlTaskEntry, "walle_control", WallEConfig::kControlTaskStackBytes,
+      this, WallEConfig::kControlTaskPriority, &controlTaskHandle_,
+      WallEConfig::kControlTaskCore);
+  if (taskCreated != pdPASS) {
+    vQueueDelete(uiMessageQueue_);
+    uiMessageQueue_ = nullptr;
+    controlTaskHandle_ = nullptr;
+    logger_.error("control task creation failed; using loop fallback");
+    return;
+  }
+  controlTaskStarted_ = true;
+  logger_.info("control task started on core 0");
+}
+
+/**
+ * 中文：应用循环；读取一条串口输入并根据前缀分发到主屏或眼睛屏。
+ * English: Application loop; reads one Serial input packet and dispatches it to the main display or eye display by prefix.
+ *
+ * @param 无 / None.
+ * @return 无 / None.
+ */
+void AppController::loop() {
+  eyeDisplay_.update();
+  processImageStream();
+
+  QueuedInputPacket queuedPacket;
+  if (controlTaskStarted_) {
+    if (xQueueReceive(uiMessageQueue_, &queuedPacket, 0) == pdTRUE) {
+      InputPacket packet;
+      packet.data = queuedPacket.data;
+      packet.length = queuedPacket.length;
+      processUiPacket(packet);
+    }
+  } else {
+    flushNetworkResponses();
+    char networkResponse[512] = {0};
+    InputPacket packet;
+    if (input_.poll(packet)) {
+      bool applyAccepted = false;
+      if (networkConfig_.handleSerialCommand(packet.data, packet.length,
+                                             networkResponse,
+                                             sizeof(networkResponse),
+                                             applyAccepted)) {
+        const bool responseSent = serialPrintln(networkResponse);
+        if (applyAccepted && responseSent) networkConfig_.acknowledgeApplyOutput();
+      } else if (!handleControlPacket(packet)) {
+        processUiPacket(packet);
+      }
+    } else {
+      applyPca9685DefaultsIfNeeded();
+    }
+  }
+
+  updateCameraState();
+  updateNetworkScreen();
+  returnToPowerIfChatIdle();
+  if (screenMode_ == ScreenMode::CameraStreaming) {
+    taskYIELD();
+  } else {
+    delay(1);
+  }
+}
+
+void AppController::processImageStream() {
+  ImageStreamEvent event;
+  if (!imageStream_.poll(event)) {
+    return;
+  }
+
+  switch (event.type) {
+    case ImageStreamEventType::Connected:
+      logger_.info("image server connected");
+      return;
+    case ImageStreamEventType::Disconnected:
+      logger_.warn("image server disconnected");
+      if (screenMode_ == ScreenMode::CameraStreaming) {
+        beginCameraHold();
+      }
+      return;
+    case ImageStreamEventType::StreamStarted:
+      beginCameraStream(event);
+      return;
+    case ImageStreamEventType::FrameReady: {
+      if (screenMode_ == ScreenMode::CameraStreaming && event.data != nullptr &&
+          event.length > 0) {
+        if (display_.showJpegFrame(event.data, event.length)) {
+          cameraHasFrame_ = true;
+          cameraLastFrameMs_ = millis();
+          ++cameraFramesDisplayed_;
+        } else {
+          logger_.warn("camera JPEG frame decode failed");
+        }
+      }
+      imageStream_.releaseFrame(event.frameToken);
+      return;
+    }
+    case ImageStreamEventType::StreamEnded:
+      if (screenMode_ == ScreenMode::CameraStreaming) {
+        beginCameraHold();
+      }
+      return;
+    case ImageStreamEventType::ProtocolError:
+      logger_.warn("image stream protocol error");
+      return;
+    case ImageStreamEventType::NetworkConfigConnected:
+      if (screenMode_ != ScreenMode::NetworkSetup) display_.showNetworkHost(event.host, event.port);
+      logger_.info("ESP network configuration connected");
+      return;
+    case ImageStreamEventType::NetworkConfigFailed:
+      if (screenMode_ != ScreenMode::NetworkSetup) display_.showNetworkFailure();
+      logger_.warn("ESP network configuration failed");
+      return;
+  }
+}
+
+void AppController::beginCameraStream(const ImageStreamEvent& event) {
+  if (screenMode_ == ScreenMode::NetworkSetup) return;
+  if (screenMode_ != ScreenMode::CameraStreaming &&
+      screenMode_ != ScreenMode::CameraHold) {
+    cameraReturnMode_ = screenMode_ == ScreenMode::Chat ? ScreenMode::Chat
+                                                        : ScreenMode::Power;
+  }
+  screenMode_ = ScreenMode::CameraStreaming;
+  cameraStreamStartedMs_ = millis();
+  cameraLastFrameMs_ = cameraStreamStartedMs_;
+  cameraHoldStartedMs_ = 0;
+  cameraFramesDisplayed_ = 0;
+  cameraHasFrame_ = false;
+  cameraStreamPersistent_ = event.streamDurationMs == UINT32_MAX;
+  cameraStreamDurationMs_ = cameraStreamPersistent_
+                                ? 0
+                                : event.streamDurationMs > 0
+                                ? min(event.streamDurationMs,
+                                      static_cast<uint32_t>(10000))
+                                : WallEConfig::kCameraStreamDurationMs;
+  cameraHoldDurationMs_ = event.holdDurationMs > 0
+                              ? min(event.holdDurationMs,
+                                    static_cast<uint32_t>(10000))
+                              : WallEConfig::kCameraHoldDurationMs;
+  display_.showCameraWaiting();
+  logger_.info("camera preview started");
+}
+
+void AppController::beginCameraHold() {
+  if (screenMode_ != ScreenMode::CameraStreaming) {
+    return;
+  }
+  if (!cameraHasFrame_) {
+    logger_.warn("camera preview ended without a valid frame");
+    restoreScreenAfterCamera();
+    return;
+  }
+  uint32_t elapsedMs = static_cast<uint32_t>(millis() -
+                                             cameraStreamStartedMs_);
+  if (elapsedMs == 0) {
+    elapsedMs = 1;
+  }
+  const uint32_t fpsTenths =
+      static_cast<uint32_t>((static_cast<uint64_t>(cameraFramesDisplayed_) *
+                             10000ULL) /
+                            elapsedMs);
+  char previewSummary[80];
+  snprintf(previewSummary, sizeof(previewSummary),
+           "camera preview: %lu frames, %lu.%lu fps",
+           static_cast<unsigned long>(cameraFramesDisplayed_),
+           static_cast<unsigned long>(fpsTenths / 10),
+           static_cast<unsigned long>(fpsTenths % 10));
+  logger_.info(previewSummary);
+  screenMode_ = ScreenMode::CameraHold;
+  cameraHoldStartedMs_ = millis();
+  logger_.info("camera final frame hold started");
+}
+
+void AppController::updateCameraState() {
+  const uint32_t now = millis();
+  if (screenMode_ == ScreenMode::CameraStreaming) {
+    const bool streamDeadlineReached =
+        !cameraStreamPersistent_ &&
+        now - cameraStreamStartedMs_ >=
+            cameraStreamDurationMs_ + WallEConfig::kCameraStreamGraceMs;
+    const bool frameStreamStalled =
+        !cameraStreamPersistent_ && cameraHasFrame_ &&
+        now - cameraLastFrameMs_ >= WallEConfig::kCameraFrameIdleTimeoutMs;
+    if (streamDeadlineReached || frameStreamStalled) {
+      beginCameraHold();
+    }
+    return;
+  }
+  if (screenMode_ == ScreenMode::CameraHold &&
+      now - cameraHoldStartedMs_ >= cameraHoldDurationMs_) {
+    restoreScreenAfterCamera();
+  }
+}
+
+void AppController::restoreScreenAfterCamera() {
+  if (cameraReturnMode_ == ScreenMode::Chat) {
+    screenMode_ = ScreenMode::Chat;
+    display_.render(session_);
+    display_.showStatus(state_);
+  } else {
+    screenMode_ = ScreenMode::Power;
+    display_.showPower(powerPercent_);
+  }
+  cameraHasFrame_ = false;
+  cameraFramesDisplayed_ = 0;
+  cameraStreamPersistent_ = false;
+  logger_.info("camera preview complete");
+}
+
+void AppController::updateNetworkScreen() {
+  if (screenMode_ != ScreenMode::NetworkSetup || strcmp(networkScreen_.state, "done") != 0 ||
+      millis() - networkDoneAtMs_ < 3000) return;
+  screenMode_ = ScreenMode::Power;
+  display_.showPower(powerPercent_);
+  display_.showNetworkHost(networkScreen_.ip, networkScreen_.port);
+}
+
+void AppController::processUiPacket(const InputPacket& packet) {
+
+  if (startsWithIgnoreCase(packet.data, packet.length, "hostnet:")) {
+    HostNetworkScreen screen;
+    const bool valid = parseHostNetworkScreen(packet.data, packet.length, screen);
+    if (valid) {
+      cameraHasFrame_ = false;
+      cameraStreamPersistent_ = false;
+      networkScreen_ = screen;
+      networkDoneAtMs_ = millis();
+      screenMode_ = ScreenMode::NetworkSetup;
+      display_.showHostNetworkSetup(screen);
+    }
+    char response[80];
+    snprintf(response, sizeof(response), "NETCFG:RESULT:%lu|HOSTSCREEN|%u|0",
+             static_cast<unsigned long>(screen.sequence), valid ? 0 : 3);
+    serialPrintln(response);
+    return;
+  }
+
+  if (state_ != AppState::Ready) {
+    logger_.warn("input dropped while not ready");
+    return;
+  }
+
+  int numberValue = 0;
+  if (startsWithIgnoreCase(packet.data, packet.length, "power:")) {
+    if (!parseNumberAfterPrefix(packet, "power:", numberValue)) {
+      logger_.warn("invalid power command");
+      return;
+    }
+    if (numberValue > 100) {
+      numberValue = 100;
+    }
+    powerPercent_ = static_cast<uint8_t>(numberValue);
+    if (screenMode_ == ScreenMode::Power) {
+      display_.updatePower(powerPercent_);
+    }
+    return;
+  }
+
+  if (startsWithIgnoreCase(packet.data, packet.length, "openchat:")) {
+    if (!parseNumberAfterPrefix(packet, "openchat:", numberValue)) {
+      logger_.warn("invalid openchat command");
+      return;
+    }
+    setChatOpen(numberValue == 1);
+    return;
+  }
+
+  if (startsWithIgnoreCase(packet.data, packet.length, "eyeconfig:")) {
+    constexpr size_t prefixLength = 10;
+    if (equalsIgnoreCase(packet.data + prefixLength, packet.length - prefixLength, "query")) {
+      const EyeSettings& s = eyeDisplay_.settings();
+      char response[512];
+      snprintf(response, sizeof(response),
+          "EYE:STATE:color=%06lX,ringColor=%06lX,dotColor=%06lX,brightness=%.2f,"
+          "ringBrightness=%.2f,dotBrightness=%.2f,minScale=%.2f,scale=%.2f,maxScale=%.2f,"
+          "glow=%.1f,range=%.2f,x=%.1f,y=%.1f,breathMs=%.0f,blinkMs=%.0f,dots=%d,ring=%d,mood=%s,auto=%d,ready=%d",
+          static_cast<unsigned long>(s.coreColor), static_cast<unsigned long>(s.ringColor),
+          static_cast<unsigned long>(s.dotColor), s.brightness, s.ringBrightness,
+          s.dotBrightness, s.minScale, s.scale, s.maxScale, s.glow, s.range,
+          s.x, s.y, s.breathMs, s.blinkMs, s.dots, s.ring, eyeMoodName(s.mood),
+          s.autoMove, eyeDisplay_.renderOk());
+      serialPrintln(response);
+    } else if (!eyeDisplay_.renderOk()) {
+      serialPrintln("EYE:ERR:not_ready");
+    } else if (eyeDisplay_.configure(packet.data + prefixLength, packet.length - prefixLength)) {
+      serialPrintln("EYE:OK");
+    } else {
+      serialPrintln("EYE:ERR:invalid_config");
+    }
+    return;
+  }
+
+  // 中文：eyeActionData/eyeActionLength 保存解析后的眼睛动作名，例如 zoom。
+  // English: eyeActionData/eyeActionLength store the parsed eye action name such as zoom.
+  const uint8_t* eyeActionData = nullptr;
+  size_t eyeActionLength = 0;
+  if (parseEyeAction(packet, eyeActionData, eyeActionLength)) {
+    if (!eyeDisplay_.renderOk()) {
+      serialPrintln("EYE:ERR:not_ready");
+      return;
+    }
+    if (startsWithIgnoreCase(eyeActionData, eyeActionLength, "look:")) {
+      constexpr size_t lookPrefixLength = 5;
+      const size_t lookLength = eyeActionLength - lookPrefixLength;
+      if (lookLength == 0 || lookLength > 232) {
+        serialPrintln("EYE:ERR:invalid_position");
+        return;
+      }
+      char config[241] = {};
+      const int written = snprintf(config, sizeof(config), "auto=0,%.*s",
+                                   static_cast<int>(lookLength),
+                                   reinterpret_cast<const char*>(eyeActionData + lookPrefixLength));
+      if (written <= 0 || static_cast<size_t>(written) >= sizeof(config) ||
+          !eyeDisplay_.configure(reinterpret_cast<const uint8_t*>(config), written)) {
+        serialPrintln("EYE:ERR:invalid_position");
+      } else {
+        serialPrintln("EYE:OK");
+      }
+    } else if (equalsIgnoreCase(eyeActionData, eyeActionLength, "zoom")) {
+      logger_.info("eye action: zoom");
+      eyeDisplay_.playZoom();
+      serialPrintln("EYE:OK");
+    } else if (equalsIgnoreCase(eyeActionData, eyeActionLength, "blink")) {
+      eyeDisplay_.blink();
+      serialPrintln("EYE:OK");
+    } else if (startsWithIgnoreCase(eyeActionData, eyeActionLength, "mood:")) {
+      constexpr size_t moodPrefixLength = 5;
+      const size_t moodLength = eyeActionLength - moodPrefixLength;
+      char config[32] = {};
+      const int written = snprintf(config, sizeof(config), "mood=%.*s",
+                                   static_cast<int>(moodLength),
+                                   reinterpret_cast<const char*>(eyeActionData + moodPrefixLength));
+      if (moodLength == 0 || written <= 0 || static_cast<size_t>(written) >= sizeof(config) ||
+          !eyeDisplay_.configure(reinterpret_cast<const uint8_t*>(config), written)) {
+        serialPrintln("EYE:ERR:invalid_mood");
+      } else {
+        serialPrintln("EYE:OK");
+      }
+    } else if (equalsIgnoreCase(eyeActionData, eyeActionLength, "dot") ||
+               equalsIgnoreCase(eyeActionData, eyeActionLength, "flame") ||
+               equalsIgnoreCase(eyeActionData, eyeActionLength, "heart")) {
+      char config[16] = {};
+      const int written = snprintf(config, sizeof(config), "mood=%.*s",
+                                   static_cast<int>(eyeActionLength),
+                                   reinterpret_cast<const char*>(eyeActionData));
+      if (written <= 0 || static_cast<size_t>(written) >= sizeof(config) ||
+          !eyeDisplay_.configure(reinterpret_cast<const uint8_t*>(config), written)) {
+        serialPrintln("EYE:ERR:invalid_mood");
+      } else {
+        serialPrintln("EYE:OK");
+      }
+    } else {
+      logger_.warn("unknown eye action");
+    }
+    return;
+  }
+
+  // 中文：role/messageData/messageLength 保存解析后的主屏聊天消息。
+  // English: role/messageData/messageLength store the parsed chat message for the main display.
+  ChatRole role = ChatRole::User;
+  const uint8_t* messageData = nullptr;
+  size_t messageLength = 0;
+  if (!parseSerialMessage(packet, role, messageData, messageLength)) {
+    return;
+  }
+
+  const bool chatVisible = screenMode_ == ScreenMode::Chat;
+  const bool chatRestoresAfterCamera =
+      (screenMode_ == ScreenMode::CameraStreaming ||
+       screenMode_ == ScreenMode::CameraHold) &&
+      cameraReturnMode_ == ScreenMode::Chat;
+  if (!chatVisible && !chatRestoresAfterCamera) {
+    logger_.warn("chat message dropped while chat closed");
+    return;
+  }
+
+  lastChatActivityMs_ = millis();
+  session_.add(role, messageData, messageLength);
+  if (chatVisible) {
+    display_.render(session_);
+  }
+  setState(AppState::Ready);
+}
+
+bool AppController::handleControlPacket(const InputPacket& packet) {
+  if (startsWithIgnoreCase(packet.data, packet.length, "pca9685:")) {
+    int32_t values[15];
+    if (parsePca9685(packet, values)) {
+      pca9685Rx_ = true;
+      pca9685_.setChannels(values, 15);
+    }
+    return true;
+  }
+
+  if (equalsIgnoreCase(packet.data, packet.length, "getname:WHO_ARE_YOU")) {
+    serialPrintln("IAM:WALL_E_TFT");
+    return true;
+  }
+  return false;
+}
+
+bool AppController::enqueueUiPacket(const InputPacket& packet) {
+  if (uiMessageQueue_ == nullptr || packet.data == nullptr ||
+      packet.length == 0 || packet.length > WallEConfig::kInputMaxBytes) {
+    return false;
+  }
+
+  QueuedInputPacket queuedPacket;
+  queuedPacket.length = static_cast<uint16_t>(packet.length);
+  memcpy(queuedPacket.data, packet.data, packet.length);
+  return xQueueSend(uiMessageQueue_, &queuedPacket, 0) == pdTRUE;
+}
+
+void AppController::applyPca9685DefaultsIfNeeded() {
+  if (pca9685Rx_ || millis() - bootMs_ <= 5000) {
+    return;
+  }
+
+  pca9685Rx_ = true;
+  logger_.info("pca9685: 5s timeout, applying default neutral/stop");
+  const int32_t defaults[15] = {
+      2800, 6500, 1920, 8000, 5000, 2000, 2000, 2000, 8000,
+      0, 0, 0, 0, 0, 0};
+  pca9685_.setChannels(defaults, 15);
+}
+
+void AppController::controlTaskEntry(void* parameter) {
+  AppController* controller = static_cast<AppController*>(parameter);
+  if (controller != nullptr) {
+    controller->runControlTask();
+  }
+  vTaskDelete(nullptr);
+}
+
+bool AppController::flushNetworkResponses() {
+  bool sent = false;
+  for (;;) {
+    if (pendingNetworkResponse_[0] == '\0' &&
+        !networkConfig_.pollSerialResponse(pendingNetworkResponse_,
+                                           sizeof(pendingNetworkResponse_))) {
+      return sent;
+    }
+    if (!serialPrintln(pendingNetworkResponse_)) return sent;
+    pendingNetworkResponse_[0] = '\0';
+    sent = true;
+  }
+}
+
+void AppController::runControlTask() {
+  for (;;) {
+    bool handledPacket = flushNetworkResponses();
+    bool pca9685Pending = false;
+    int32_t latestPca9685Values[15] = {0};
+    char networkResponse[512] = {0};
+    for (uint8_t packetCount = 0; packetCount < 8; ++packetCount) {
+      InputPacket packet;
+      if (!input_.poll(packet)) {
+        break;
+      }
+      handledPacket = true;
+      // PCA9685 packets describe a complete hardware state. If several have
+      // accumulated in USB Serial, only the newest state in this batch should
+      // reach the servos; replaying stale states creates a catch-up burst.
+      if (startsWithIgnoreCase(packet.data, packet.length, "pca9685:")) {
+        if (parsePca9685(packet, latestPca9685Values)) {
+          pca9685Rx_ = true;
+          pca9685Pending = true;
+        }
+        continue;
+      }
+      bool applyAccepted = false;
+      if (networkConfig_.handleSerialCommand(packet.data, packet.length,
+                                             networkResponse,
+                                             sizeof(networkResponse),
+                                             applyAccepted)) {
+        const bool responseSent = serialPrintln(networkResponse);
+        if (applyAccepted && responseSent) networkConfig_.acknowledgeApplyOutput();
+      } else if (!handleControlPacket(packet)) {
+        enqueueUiPacket(packet);
+      }
+    }
+
+    if (pca9685Pending) {
+      pca9685_.setChannels(latestPca9685Values, 15);
+    }
+
+    applyPca9685DefaultsIfNeeded();
+    if (handledPacket) {
+      taskYIELD();
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+}
+
+/**
+ * 中文：更新控制器状态并立即刷新主屏状态栏。
+ * English: Updates the controller state and immediately refreshes the main display status bar.
+ *
+ * @param state 中文：新的应用状态。
+ *              English: New application state.
+ * @return 无 / None.
+ */
+void AppController::setState(AppState state) {
+  state_ = state;
+  if (screenMode_ == ScreenMode::Chat) {
+    display_.showStatus(state_);
+  }
+}
+
+void AppController::setChatOpen(bool open) {
+  if (screenMode_ == ScreenMode::NetworkSetup) return;
+  if (screenMode_ == ScreenMode::CameraStreaming ||
+      screenMode_ == ScreenMode::CameraHold) {
+    cameraReturnMode_ = open ? ScreenMode::Chat : ScreenMode::Power;
+    if (open) {
+      lastChatActivityMs_ = millis();
+    }
+    return;
+  }
+  if (open) {
+    screenMode_ = ScreenMode::Chat;
+    lastChatActivityMs_ = millis();
+    display_.render(session_);
+    display_.showStatus(state_);
+    return;
+  }
+
+  screenMode_ = ScreenMode::Power;
+  display_.showPower(powerPercent_);
+}
+
+void AppController::returnToPowerIfChatIdle() {
+  const bool visibleChat = screenMode_ == ScreenMode::Chat;
+  const bool deferredChat =
+      (screenMode_ == ScreenMode::CameraStreaming ||
+       screenMode_ == ScreenMode::CameraHold) &&
+      cameraReturnMode_ == ScreenMode::Chat;
+  if (!visibleChat && !deferredChat) {
+    return;
+  }
+
+  if (millis() - lastChatActivityMs_ >= WallEConfig::kChatIdleReturnMs) {
+    if (deferredChat) {
+      cameraReturnMode_ = ScreenMode::Power;
+    } else {
+      setChatOpen(false);
+    }
+  }
+}
+
+}  // namespace WallE
